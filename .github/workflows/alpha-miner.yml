@@ -1,0 +1,130 @@
+# Runs the alpha miner on GitHub's servers around the clock — no local PC needed.
+#
+# A job may run at most 6 hours, so each run mines for ~5.6 hours (MINER_MINUTES), saves, and then
+# starts the next run itself, so mining continues 24/7. The 6-hourly schedule is only a safety net
+# that restarts the chain if it ever breaks (e.g. after a failed login). Each run decrypts the saved
+# state, mines, re-encrypts it into miner_state.enc and commits it, so the next run resumes exactly
+# where this one stopped. The repository is public: formulas never appear in logs, issues or files.
+#
+# This deployment runs with MINER_CHAIN=off and MINER_MAX_SIMS_PER_DAY=600, so the schedule alone starts runs.
+# Do not turn the chain on while a low daily cap is set: a run that hits the cap ends as a success, the chain
+# starts another at once, and that repeats (with a login and a commit each time) until the day rolls over.
+#
+# Stop it: set the repository variable MINER_CHAIN to "off" (stops the chain) and/or disable the
+# workflow under Actions.
+name: alpha-miner
+
+on:
+  schedule:
+    - cron: "7 */6 * * *"    # safety net; the chain normally keeps it running continuously
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How many minutes to mine"
+        default: "335"
+
+permissions:
+  contents: write   # commit the encrypted progress
+  issues: write     # announce new alphas
+  actions: write    # start the next run in the chain
+
+concurrency:
+  group: alpha-miner
+  cancel-in-progress: false
+
+jobs:
+  mine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    env:
+      BRAIN_EMAIL: ${{ secrets.BRAIN_EMAIL }}
+      BRAIN_PASSWORD: ${{ secrets.BRAIN_PASSWORD }}
+      MINER_STATE_KEY: ${{ secrets.MINER_STATE_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      # Always the newest main, not the commit that triggered the run: a queued scheduled run would
+      # otherwise restore stale progress from before the previous run saved.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Restore progress
+        run: python vault.py unpack
+
+      - name: Mine alphas
+        env:
+          MINER_MINUTES: ${{ inputs.minutes || vars.MINER_MINUTES || '335' }}
+          MINER_MAX_SIMS_PER_DAY: ${{ vars.MINER_MAX_SIMS_PER_DAY || '5000' }}
+          MINER_TELEGRAM: ${{ vars.MINER_TELEGRAM || 'all' }}
+          MINER_TELEGRAM_MIN_FITNESS: ${{ vars.MINER_TELEGRAM_MIN_FITNESS || '1.3' }}
+          MINER_SCOPES: ${{ vars.MINER_SCOPES || 'USA/1/TOP3000,USA/1/TOP1000,USA/0/TOP3000,USA/1/TOP500' }}
+        run: python miner.py
+
+      - name: Save progress
+        if: always()
+        # Only this workflow writes miner_state.enc (one run at a time), so this run's state always wins:
+        # commit it on top of the newest main instead of rebasing, which can't conflict.
+        run: |
+          python vault.py pack
+          cp miner_state.enc "$RUNNER_TEMP/state.enc"
+          git config user.name "alpha-miner[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for attempt in 1 2 3; do
+            git fetch -q origin main
+            git checkout -q -f origin/main
+            cp "$RUNNER_TEMP/state.enc" miner_state.enc
+            git add miner_state.enc
+            git diff --cached --quiet && break
+            git commit -q -m "miner: progress $(date -u '+%Y-%m-%d %H:%M') UTC"
+            git push -q origin HEAD:main && break
+            sleep 5
+          done
+
+      # Keep mining 24/7: queue the next run (only after a healthy run, so a broken login can't loop).
+      - name: Start the next run
+        if: success() && vars.MINER_CHAIN != 'off'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run alpha-miner.yml --repo "${{ github.repository }}" --ref main
+
+      - name: Alert on failure
+        if: failure()
+        run: >
+          python notify.py send "🔴 Alpha miner run failed (an error stopped it). Progress up to the error was saved.
+          Details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      # Stopped from outside: a manual restart, or GitHub's 6-hour job limit. Not an error in the miner.
+      - name: Note a stopped run
+        if: cancelled()
+        run: >
+          python notify.py send "⏹️ A miner run was stopped before it finished (a manual restart or GitHub's time limit).
+          Its progress was saved and mining continues. Only worry if this repeats several times a day:
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      # A cancelled run doesn't start the next one, so restart the chain here (unless paused).
+      - name: Keep the chain going after a stop
+        if: cancelled() && vars.MINER_CHAIN != 'off'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run alpha-miner.yml --repo "${{ github.repository }}" --ref main
+
+      - name: Announce new alphas
+        if: always() && hashFiles('miner/new_ready.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "The miner found new alphas that pass every check, including correlation."
+            echo "Open each Alpha ID on BRAIN (**Alphas → Unsubmitted**) and submit 1–2 per day."
+            echo
+            cat miner/new_ready.md
+          } > body.md
+          gh issue create --title "New alphas ready to submit ($(date -u '+%Y-%m-%d'))" --body-file body.md
